@@ -13,7 +13,7 @@ export function activate(context: vscode.ExtensionContext) {
 	// Register the Hugging Face provider under the vendor id used in package.json
 	vscode.lm.registerLanguageModelChatProvider("huggingface", provider);
 
-	// Management command to configure API key
+	// Management command to configure API key and optional organization billing
 	context.subscriptions.push(
 		vscode.commands.registerCommand("huggingface.manage", async () => {
 			const existing = await context.secrets.get("huggingface.apiKey");
@@ -30,10 +30,28 @@ export function activate(context: vscode.ExtensionContext) {
 			if (!apiKey.trim()) {
 				await context.secrets.delete("huggingface.apiKey");
 				vscode.window.showInformationMessage("Hugging Face API key cleared.");
-				return;
+			} else {
+				await context.secrets.store("huggingface.apiKey", apiKey.trim());
+				vscode.window.showInformationMessage("Hugging Face API key saved.");
 			}
-			await context.secrets.store("huggingface.apiKey", apiKey.trim());
-			vscode.window.showInformationMessage("Hugging Face API key saved.");
+
+			const config = vscode.workspace.getConfiguration("huggingface");
+			const existingBillTo = config.get<string>("billTo") ?? "";
+			const billTo = await vscode.window.showInputBox({
+				title: "Hugging Face Organization Billing",
+				prompt: "Optional org name to bill inference requests to",
+				ignoreFocusOut: true,
+				value: existingBillTo,
+			});
+			if (billTo === undefined) {
+				return; // user canceled
+			}
+			await config.update("billTo", billTo.trim(), vscode.ConfigurationTarget.Global);
+			if (!billTo.trim()) {
+				vscode.window.showInformationMessage("Hugging Face organization billing cleared.");
+			} else {
+				vscode.window.showInformationMessage("Hugging Face organization billing saved.");
+			}
 		})
 	);
 }

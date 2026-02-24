@@ -50,7 +50,17 @@
 				"command": "huggingface.manage",
 				"title": "Manage Hugging Face Provider"
 			}
-		]
+		],
+		"configuration": {
+			"title": "Hugging Face Provider",
+			"properties": {
+				"huggingface.billTo": {
+					"type": "string",
+					"default": "",
+					"description": "Optional organization name to bill Hugging Face inference requests to."
+				}
+			}
+		}
 	},
 	"main": "./out/extension.js",
 	"scripts": {

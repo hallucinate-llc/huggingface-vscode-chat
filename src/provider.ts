@@ -17,11 +17,55 @@ const BASE_URL = "https://router.huggingface.co/v1";
 const DEFAULT_MAX_OUTPUT_TOKENS = 16000;
 const DEFAULT_CONTEXT_LENGTH = 128000;
 
+type HFStreamReader = {
+	read(): Promise<{ done: boolean; value?: Uint8Array }>;
+	releaseLock(): void;
+};
+
+type HFStream = {
+	getReader(): HFStreamReader;
+};
+
+type HFResponse = {
+	ok: boolean;
+	status: number;
+	statusText: string;
+	text(): Promise<string>;
+	json(): Promise<unknown>;
+	body: HFStream | null;
+};
+
+const runtimeGlobals = globalThis as unknown as {
+	fetch?: (input: string, init?: { method?: string; headers?: Record<string, string>; body?: string }) => Promise<unknown>;
+	TextDecoder?: new () => { decode(input?: Uint8Array, options?: { stream?: boolean }): string };
+	console?: { error?: (...args: unknown[]) => void };
+};
+
+const hfFetch = async (
+	input: string,
+	init?: { method?: string; headers?: Record<string, string>; body?: string },
+): Promise<HFResponse> => {
+	if (!runtimeGlobals.fetch) {
+		throw new Error("Fetch API is not available in this runtime.");
+	}
+	return (await runtimeGlobals.fetch(input, init)) as HFResponse;
+};
+
+const createTextDecoder = (): { decode(input?: Uint8Array, options?: { stream?: boolean }): string } => {
+	if (!runtimeGlobals.TextDecoder) {
+		throw new Error("TextDecoder is not available in this runtime.");
+	}
+	return new runtimeGlobals.TextDecoder();
+};
+
+const logError = (...args: unknown[]): void => {
+	runtimeGlobals.console?.error?.(...args);
+};
+
 /**
  * VS Code Chat provider backed by Hugging Face Inference Providers.
  */
 export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
-	private _chatEndpoints: { model: string; modelMaxPromptTokens: number }[] = [];
 	/** Buffer for assembling streamed tool calls by index. */
 	private _toolCallBuffers: Map<number, { id?: string; name?: string; args: string }> = new Map<
 		number,
@@ -78,6 +122,13 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		} catch {
 			return 0;
 		}
+	}
+
+	/** Optional organization to bill requests to, as configured by the user. */
+	private getBillTo(): string | undefined {
+		const billTo = vscode.workspace.getConfiguration("huggingface").get<string>("billTo");
+		const trimmed = billTo?.trim();
+		return trimmed ? trimmed : undefined;
 	}
 
 	/**
@@ -181,11 +232,6 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			return entries;
 		});
 
-		this._chatEndpoints = infos.map((info) => ({
-			model: info.id,
-			modelMaxPromptTokens: info.maxInputTokens + info.maxOutputTokens,
-		}));
-
 		return infos;
 	}
 
@@ -204,7 +250,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 		apiKey: string
 	): Promise<{ models: HFModelItem[] }> {
 			const modelsList = (async () => {
-				const resp = await fetch(`${BASE_URL}/models`, {
+				const resp = await hfFetch(`${BASE_URL}/models`, {
 					method: "GET",
 					headers: { Authorization: `Bearer ${apiKey}`, "User-Agent": this.userAgent },
 				});
@@ -213,12 +259,12 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 					try {
 						text = await resp.text();
 					} catch (error) {
-						console.error("[Hugging Face Model Provider] Failed to read response text", error);
+						logError("[Hugging Face Model Provider] Failed to read response text", error);
 					}
 					const err = new Error(
 						`Failed to fetch Hugging Face models: ${resp.status} ${resp.statusText}${text ? `\n${text}` : ""}`
 					);
-					console.error("[Hugging Face Model Provider] Failed to fetch Hugging Face models", err);
+					logError("[Hugging Face Model Provider] Failed to fetch Hugging Face models", err);
 					throw err;
 				}
 				const parsed = (await resp.json()) as HFModelsResponse;
@@ -229,7 +275,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 				const models = await modelsList;
 				return { models };
 			} catch (err) {
-				console.error("[Hugging Face Model Provider] Failed to fetch Hugging Face models", err);
+				logError("[Hugging Face Model Provider] Failed to fetch Hugging Face models", err);
 				throw err;
 			}
 		}
@@ -268,7 +314,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 				try {
 					progress.report(part);
 				} catch (e) {
-					console.error("[Hugging Face Model Provider] Progress.report failed", {
+					logError("[Hugging Face Model Provider] Progress.report failed", {
 						modelId: model.id,
 						error: e instanceof Error ? { name: e.name, message: e.message } : String(e),
 					});
@@ -280,6 +326,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			if (!apiKey) {
 				throw new Error("Hugging Face API key not found");
 			}
+			const billTo = this.getBillTo();
 
             const openaiMessages = convertMessages(messages);
 
@@ -291,13 +338,13 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
             throw new Error("Cannot have more than 128 tools per request.");
         }
 
-            const inputTokenCount = this.estimateMessagesTokens(messages);
-            const toolTokenCount = this.estimateToolTokens(toolConfig.tools);
-            const tokenLimit = Math.max(1, model.maxInputTokens);
-            if (inputTokenCount + toolTokenCount > tokenLimit) {
-                console.error("[Hugging Face Model Provider] Message exceeds token limit", { total: inputTokenCount + toolTokenCount, tokenLimit });
-                throw new Error("Message exceeds token limit.");
-            }
+			const inputTokenCount = this.estimateMessagesTokens(messages);
+			const toolTokenCount = this.estimateToolTokens(toolConfig.tools);
+			const tokenLimit = Math.max(1, model.maxInputTokens);
+			if (inputTokenCount + toolTokenCount > tokenLimit) {
+				logError("[Hugging Face Model Provider] Message exceeds token limit", { total: inputTokenCount + toolTokenCount, tokenLimit });
+				throw new Error("Message exceeds token limit.");
+			}
 
             requestBody = {
                 model: model.id,
@@ -327,19 +374,23 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			if (toolConfig.tool_choice) {
 				(requestBody as Record<string, unknown>).tool_choice = toolConfig.tool_choice;
 			}
-			const response = await fetch(`${BASE_URL}/chat/completions`, {
-                method: "POST",
-                headers: {
-                    Authorization: `Bearer ${apiKey}`,
-                    "Content-Type": "application/json",
-					"User-Agent": this.userAgent,
-                },
-                body: JSON.stringify(requestBody),
-            });
+			const headers: Record<string, string> = {
+				Authorization: `Bearer ${apiKey}`,
+				"Content-Type": "application/json",
+				"User-Agent": this.userAgent,
+			};
+			if (billTo) {
+				headers["X-HF-Bill-To"] = billTo;
+			}
+			const response = await hfFetch(`${BASE_URL}/chat/completions`, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(requestBody),
+			});
 
 			if (!response.ok) {
 				const errorText = await response.text();
-				console.error("[Hugging Face Model Provider] HF API error response", errorText);
+				logError("[Hugging Face Model Provider] HF API error response", errorText);
 				throw new Error(
 					`Hugging Face API error: ${response.status} ${response.statusText}${errorText ? `\n${errorText}` : ""}`
 				);
@@ -350,7 +401,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 			}
 			await this.processStreamingResponse(response.body, trackingProgress, token);
 		} catch (err) {
-			console.error("[Hugging Face Model Provider] Chat request failed", {
+			logError("[Hugging Face Model Provider] Chat request failed", {
 				modelId: model.id,
 				messageCount: messages.length,
 				error: err instanceof Error ? { name: err.name, message: err.message } : String(err),
@@ -367,7 +418,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 	 * @returns A promise that resolves to the number of tokens
 	 */
 	async provideTokenCount(
-		model: LanguageModelChatInformation,
+		_model: LanguageModelChatInformation,
 		text: string | LanguageModelChatMessage,
 		_token: CancellationToken
 	): Promise<number> {
@@ -411,14 +462,14 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 	 * @param progress Progress reporter for streamed parts.
 	 * @param token Cancellation token.
 	 */
-	    private async processStreamingResponse(
-	        responseBody: ReadableStream<Uint8Array>,
-	        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-	        token: vscode.CancellationToken,
-	    ): Promise<void> {
-        const reader = responseBody.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
+		private async processStreamingResponse(
+			responseBody: HFStream,
+			progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+			token: vscode.CancellationToken,
+		): Promise<void> {
+		const reader = responseBody.getReader();
+		const decoder = createTextDecoder();
+		let buffer = "";
 
 			try {
 				while (!token.isCancellationRequested) {
@@ -779,11 +830,11 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
         }
         for (const [idx, buf] of Array.from(this._toolCallBuffers.entries())) {
             const parsed = tryParseJSONObject(buf.args);
-            if (!parsed.ok) {
-                if (throwOnInvalid) {
-                    console.error("[Hugging Face Model Provider] Invalid JSON for tool call", { idx, snippet: (buf.args || "").slice(0, 200) });
-                    throw new Error("Invalid JSON for tool call");
-                }
+			if (!parsed.ok) {
+				if (throwOnInvalid) {
+					logError("[Hugging Face Model Provider] Invalid JSON for tool call", { idx, snippet: (buf.args || "").slice(0, 200) });
+					throw new Error("Invalid JSON for tool call");
+				}
                 // When not throwing (e.g. on [DONE]), drop silently to reduce noise
                 continue;
             }

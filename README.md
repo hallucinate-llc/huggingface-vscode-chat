@@ -30,6 +30,9 @@ Each model entry also offers `cheapest` and `fastest` mode for each model. `fast
 * VS Code 1.104.0 or higher.
 * Hugging Face access token with `inference.serverless` permissions.
 
+## Organization Billing
+If you want to bill inference requests to a Hugging Face organization, set the `huggingface.billTo` setting to your org name. The extension will forward it as `X-HF-Bill-To` on inference requests.
+
 ## 🛠️ Development
 ```bash
 git clone https://github.com/huggingface/huggingface-vscode-chat
